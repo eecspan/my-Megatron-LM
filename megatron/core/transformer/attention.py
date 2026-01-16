@@ -123,6 +123,9 @@ def _fake_fp8_quantize_ste(x: Tensor, fp8_dtype: torch.dtype, scale: float) -> T
     return out
 
 
+_KV_FP8_FAKE_QAT_DEBUG_PRINTED = False
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
@@ -829,8 +832,22 @@ class Attention(MegatronModule, ABC):
         kv_fp8_cfg = _get_kv_fp8_fake_qat_config()
         if kv_fp8_cfg and self.training and inference_context is None and key is not None and value is not None:
             fp8_dtype, scale = kv_fp8_cfg
-            key = _fake_fp8_quantize_ste(key, fp8_dtype, scale)
-            value = _fake_fp8_quantize_ste(value, fp8_dtype, scale)
+            key_q = _fake_fp8_quantize_ste(key, fp8_dtype, scale)
+            value_q = _fake_fp8_quantize_ste(value, fp8_dtype, scale)
+            if os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_DEBUG", "0") == "1":
+                global _KV_FP8_FAKE_QAT_DEBUG_PRINTED
+                if not _KV_FP8_FAKE_QAT_DEBUG_PRINTED:
+                    _KV_FP8_FAKE_QAT_DEBUG_PRINTED = True
+                    with torch.no_grad():
+                        k_diff = (key_q - key).abs().max().item()
+                        v_diff = (value_q - value).abs().max().item()
+                    print(
+                        "[KV_FP8_FAKE_QAT] max|k-q|="
+                        f"{k_diff:.6f}, max|v-q|={v_diff:.6f}, "
+                        f"scale={scale}, dtype={fp8_dtype}"
+                    )
+            key = key_q
+            value = value_q
 
         # ==================================
         # core attention computation
