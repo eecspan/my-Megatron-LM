@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+import functools
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
 
@@ -82,6 +84,43 @@ try:
 except ImportError:
     HAVE_TE = False
     SplitAlongDim, TELinear, set_save_original_input = None, None, None
+
+
+@functools.lru_cache(maxsize=None)
+def _get_kv_fp8_fake_qat_config():
+    if os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_FLAG", "0") != "1":
+        return None
+
+    dtype_str = os.getenv("OPEN_TRAINING_KV_FP8_DTYPE", "e4m3").lower()
+    if dtype_str in {"e4m3", "fp8_e4m3", "float8_e4m3fn"}:
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("FP8 e4m3 not supported by this PyTorch build.")
+        fp8_dtype = torch.float8_e4m3fn
+    elif dtype_str in {"e5m2", "fp8_e5m2", "float8_e5m2"}:
+        if not hasattr(torch, "float8_e5m2"):
+            raise RuntimeError("FP8 e5m2 not supported by this PyTorch build.")
+        fp8_dtype = torch.float8_e5m2
+    else:
+        raise ValueError(f"Unknown OPEN_TRAINING_KV_FP8_DTYPE: {dtype_str}")
+
+    scale = float(os.getenv("OPEN_TRAINING_KV_FP8_SCALE", "1.0"))
+    if scale <= 0:
+        raise ValueError("OPEN_TRAINING_KV_FP8_SCALE must be > 0")
+
+    return fp8_dtype, scale
+
+
+def _fake_fp8_quantize_ste(x: Tensor, fp8_dtype: torch.dtype, scale: float) -> Tensor:
+    x_scaled = x / scale if scale != 1.0 else x
+    x_q = x_scaled.to(fp8_dtype)
+    x_dq = x_q.to(x.dtype)
+    if scale != 1.0:
+        x_dq = x_dq * scale
+
+    out = x + (x_dq - x).detach()
+    if hasattr(x, "main_grad"):
+        out.main_grad = x.main_grad
+    return out
 
 
 @dataclass
@@ -785,6 +824,13 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        # Fake-quantize KV activations to mimic FP8 KV cache effects in training.
+        kv_fp8_cfg = _get_kv_fp8_fake_qat_config()
+        if kv_fp8_cfg and self.training and inference_context is None and key is not None and value is not None:
+            fp8_dtype, scale = kv_fp8_cfg
+            key = _fake_fp8_quantize_ste(key, fp8_dtype, scale)
+            value = _fake_fp8_quantize_ste(value, fp8_dtype, scale)
 
         # ==================================
         # core attention computation
