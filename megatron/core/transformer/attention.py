@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 import functools
+import json
 import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -107,7 +108,78 @@ def _get_kv_fp8_fake_qat_config():
     if scale <= 0:
         raise ValueError("OPEN_TRAINING_KV_FP8_SCALE must be > 0")
 
-    return fp8_dtype, scale
+    scale_path = os.getenv("OPEN_TRAINING_KV_FP8_SCALE_PATH")
+    if scale_path:
+        k_scales, v_scales = _load_kv_fp8_fake_qat_scales(scale_path)
+    else:
+        k_scales, v_scales = None, None
+
+    return fp8_dtype, scale, k_scales, v_scales
+
+
+def _normalize_kv_scale_list(scales):
+    if isinstance(scales, dict):
+        if not scales:
+            return []
+        max_idx = max(int(k) for k in scales.keys())
+        values = [0.0] * (max_idx + 1)
+        for k, v in scales.items():
+            values[int(k)] = float(v)
+        return values
+    if isinstance(scales, list):
+        return [float(v) for v in scales]
+    raise ValueError("KV scale list must be a list or dict.")
+
+
+def _load_kv_fp8_fake_qat_scales(scale_path: str):
+    with open(scale_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if "k_scale" in payload and "v_scale" in payload:
+        k_scales = _normalize_kv_scale_list(payload["k_scale"])
+        v_scales = _normalize_kv_scale_list(payload["v_scale"])
+    elif "layers" in payload:
+        layers = payload["layers"]
+        if not isinstance(layers, dict) or not layers:
+            raise ValueError("KV scale file 'layers' must be a non-empty dict.")
+        max_idx = max(int(k) for k in layers.keys())
+        k_scales = [0.0] * (max_idx + 1)
+        v_scales = [0.0] * (max_idx + 1)
+        for layer_idx, layer_vals in layers.items():
+            if not isinstance(layer_vals, dict):
+                raise ValueError("KV scale file layer entries must be dicts.")
+            k_scales[int(layer_idx)] = float(
+                layer_vals.get("k_scale", layer_vals.get("k", 0.0))
+            )
+            v_scales[int(layer_idx)] = float(
+                layer_vals.get("v_scale", layer_vals.get("v", 0.0))
+            )
+    else:
+        raise ValueError(
+            "KV scale file must contain 'k_scale'/'v_scale' or 'layers' keys."
+        )
+
+    if not k_scales or not v_scales:
+        raise ValueError("KV scale file must contain non-empty k/v scales.")
+    if len(k_scales) != len(v_scales):
+        raise ValueError("KV scale file k/v scale lengths do not match.")
+    if any(s <= 0 for s in k_scales) or any(s <= 0 for s in v_scales):
+        raise ValueError("KV scale values must be > 0.")
+
+    return k_scales, v_scales
+
+
+def _get_kv_fp8_fake_qat_scales_for_layer(layer_number: int):
+    cfg = _get_kv_fp8_fake_qat_config()
+    if cfg is None:
+        return None
+    fp8_dtype, default_scale, k_scales, v_scales = cfg
+    if not k_scales or not v_scales:
+        return fp8_dtype, default_scale, default_scale
+    layer_idx = layer_number - 1
+    if layer_idx < 0 or layer_idx >= len(k_scales) or layer_idx >= len(v_scales):
+        return fp8_dtype, default_scale, default_scale
+    return fp8_dtype, k_scales[layer_idx], v_scales[layer_idx]
 
 
 def _fake_fp8_quantize_ste(x: Tensor, fp8_dtype: torch.dtype, scale: float) -> Tensor:
@@ -829,11 +901,11 @@ class Attention(MegatronModule, ABC):
         nvtx_range_pop(suffix="rotary_pos_emb")
 
         # Fake-quantize KV activations to mimic FP8 KV cache effects in training.
-        kv_fp8_cfg = _get_kv_fp8_fake_qat_config()
+        kv_fp8_cfg = _get_kv_fp8_fake_qat_scales_for_layer(self.layer_number)
         if kv_fp8_cfg and self.training and inference_context is None and key is not None and value is not None:
-            fp8_dtype, scale = kv_fp8_cfg
-            key_q = _fake_fp8_quantize_ste(key, fp8_dtype, scale)
-            value_q = _fake_fp8_quantize_ste(value, fp8_dtype, scale)
+            fp8_dtype, k_scale, v_scale = kv_fp8_cfg
+            key_q = _fake_fp8_quantize_ste(key, fp8_dtype, k_scale)
+            value_q = _fake_fp8_quantize_ste(value, fp8_dtype, v_scale)
             if os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_DEBUG", "0") == "1":
                 global _KV_FP8_FAKE_QAT_DEBUG_PRINTED
                 if not _KV_FP8_FAKE_QAT_DEBUG_PRINTED:
@@ -844,7 +916,7 @@ class Attention(MegatronModule, ABC):
                     print(
                         "[KV_FP8_FAKE_QAT] max|k-q|="
                         f"{k_diff:.6f}, max|v-q|={v_diff:.6f}, "
-                        f"scale={scale}, dtype={fp8_dtype}"
+                        f"k_scale={k_scale}, v_scale={v_scale}, dtype={fp8_dtype}"
                     )
             key = key_q
             value = value_q
