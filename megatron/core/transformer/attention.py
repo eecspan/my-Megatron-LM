@@ -184,6 +184,18 @@ def _get_kv_fp8_fake_qat_scales_for_layer(layer_number: int):
 
 def _fake_fp8_quantize_ste(x: Tensor, fp8_dtype: torch.dtype, scale: float) -> Tensor:
     x_scaled = x / scale if scale != 1.0 else x
+    
+    if fp8_dtype == torch.float8_e4m3fn:
+        f8_max = 448.0
+    elif fp8_dtype == torch.float8_e5m2:
+        f8_max = 57344.0
+    else:
+        f8_max = torch.finfo(fp8_dtype).max
+
+    # 这里的 clamp 会把原本可能变成 Inf 的超大值截断为最大值
+    # 从而避免 Inf -> NaN 的转换
+    x_scaled = x_scaled.clamp(min=-f8_max, max=f8_max)
+
     x_q = x_scaled.to(fp8_dtype)
     x_dq = x_q.to(x.dtype)
     if scale != 1.0:
