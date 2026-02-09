@@ -117,6 +117,11 @@ def _get_kv_fp8_fake_qat_config():
     return fp8_dtype, scale, k_scales, v_scales
 
 
+@functools.lru_cache(maxsize=None)
+def _kv_fp8_fake_qat_apply_in_eval() -> bool:
+    return os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_IN_EVAL", "0") == "1"
+
+
 def _normalize_kv_scale_list(scales):
     if isinstance(scales, dict):
         if not scales:
@@ -914,7 +919,13 @@ class Attention(MegatronModule, ABC):
 
         # Fake-quantize KV activations to mimic FP8 KV cache effects in training.
         kv_fp8_cfg = _get_kv_fp8_fake_qat_scales_for_layer(self.layer_number)
-        if kv_fp8_cfg and self.training and inference_context is None and key is not None and value is not None:
+        if (
+            kv_fp8_cfg
+            and (self.training or _kv_fp8_fake_qat_apply_in_eval())
+            and inference_context is None
+            and key is not None
+            and value is not None
+        ):
             fp8_dtype, k_scale, v_scale = kv_fp8_cfg
             key_q = _fake_fp8_quantize_ste(key, fp8_dtype, k_scale)
             value_q = _fake_fp8_quantize_ste(value, fp8_dtype, v_scale)
