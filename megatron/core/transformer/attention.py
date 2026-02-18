@@ -122,6 +122,43 @@ def _kv_fp8_fake_qat_apply_in_eval() -> bool:
     return os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_IN_EVAL", "0") == "1"
 
 
+@functools.lru_cache(maxsize=None)
+def _get_q_fp8_fake_qat_config():
+    """Fake-quantize query activations to mimic FP8 Q casting in FA3 inference.
+
+    By default, FA3 uses per-tensor descaling for KV cache (k_descale/v_descale),
+    but does not use an explicit query scale. This config defaults to scale=1.0
+    to match that behavior.
+    """
+    if os.getenv("OPEN_TRAINING_Q_FP8_FAKE_QAT_FLAG", "0") != "1":
+        return None
+
+    dtype_str = os.getenv(
+        "OPEN_TRAINING_Q_FP8_DTYPE", os.getenv("OPEN_TRAINING_KV_FP8_DTYPE", "e4m3")
+    ).lower()
+    if dtype_str in {"e4m3", "fp8_e4m3", "float8_e4m3fn"}:
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("FP8 e4m3 not supported by this PyTorch build.")
+        fp8_dtype = torch.float8_e4m3fn
+    elif dtype_str in {"e5m2", "fp8_e5m2", "float8_e5m2"}:
+        if not hasattr(torch, "float8_e5m2"):
+            raise RuntimeError("FP8 e5m2 not supported by this PyTorch build.")
+        fp8_dtype = torch.float8_e5m2
+    else:
+        raise ValueError(f"Unknown OPEN_TRAINING_Q_FP8_DTYPE: {dtype_str}")
+
+    scale = float(os.getenv("OPEN_TRAINING_Q_FP8_SCALE", "1.0"))
+    if scale <= 0:
+        raise ValueError("OPEN_TRAINING_Q_FP8_SCALE must be > 0")
+
+    return fp8_dtype, scale
+
+
+@functools.lru_cache(maxsize=None)
+def _q_fp8_fake_qat_apply_in_eval() -> bool:
+    return os.getenv("OPEN_TRAINING_Q_FP8_FAKE_QAT_IN_EVAL", "0") == "1"
+
+
 def _normalize_kv_scale_list(scales):
     if isinstance(scales, dict):
         if not scales:
@@ -213,6 +250,7 @@ def _fake_fp8_quantize_ste(x: Tensor, fp8_dtype: torch.dtype, scale: float) -> T
 
 
 _KV_FP8_FAKE_QAT_DEBUG_PRINTED = False
+_Q_FP8_FAKE_QAT_DEBUG_PRINTED = False
 
 
 @dataclass
@@ -916,6 +954,28 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
+
+        # Fake-quantize Query activations to mimic FA3 inference casting Q to FP8.
+        q_fp8_cfg = _get_q_fp8_fake_qat_config()
+        if (
+            q_fp8_cfg
+            and (self.training or _q_fp8_fake_qat_apply_in_eval())
+            and inference_context is None
+            and query is not None
+        ):
+            fp8_dtype, q_scale = q_fp8_cfg
+            query_q = _fake_fp8_quantize_ste(query, fp8_dtype, q_scale)
+            if os.getenv("OPEN_TRAINING_Q_FP8_FAKE_QAT_DEBUG", "0") == "1":
+                global _Q_FP8_FAKE_QAT_DEBUG_PRINTED
+                if not _Q_FP8_FAKE_QAT_DEBUG_PRINTED:
+                    _Q_FP8_FAKE_QAT_DEBUG_PRINTED = True
+                    with torch.no_grad():
+                        q_diff = (query_q - query).abs().max().item()
+                    print(
+                        "[Q_FP8_FAKE_QAT] max|q-q|="
+                        f"{q_diff:.6f}, q_scale={q_scale}, dtype={fp8_dtype}"
+                    )
+            query = query_q
 
         # Fake-quantize KV activations to mimic FP8 KV cache effects in training.
         kv_fp8_cfg = _get_kv_fp8_fake_qat_scales_for_layer(self.layer_number)
