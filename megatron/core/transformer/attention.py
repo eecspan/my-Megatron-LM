@@ -119,7 +119,18 @@ def _get_kv_fp8_fake_qat_config():
 
 @functools.lru_cache(maxsize=None)
 def _kv_fp8_fake_qat_apply_in_eval() -> bool:
-    return os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_IN_EVAL", "0") == "1"
+    """Whether to apply KV fake-QAT when the module is in eval() mode.
+
+    Default behavior: if KV fake-QAT is enabled, apply it in eval as well so
+    ref-logprobs (forward_only/eval) and train-logprobs are computed under the
+    same numerics.
+
+    Set OPEN_TRAINING_KV_FP8_FAKE_QAT_IN_EVAL=0 to opt out.
+    """
+    env = os.getenv("OPEN_TRAINING_KV_FP8_FAKE_QAT_IN_EVAL")
+    if env is None:
+        return True
+    return env == "1"
 
 
 @functools.lru_cache(maxsize=None)
@@ -156,7 +167,18 @@ def _get_q_fp8_fake_qat_config():
 
 @functools.lru_cache(maxsize=None)
 def _q_fp8_fake_qat_apply_in_eval() -> bool:
-    return os.getenv("OPEN_TRAINING_Q_FP8_FAKE_QAT_IN_EVAL", "0") == "1"
+    """Whether to apply Q fake-QAT when the module is in eval() mode.
+
+    Default behavior: if Q fake-QAT is enabled, apply it in eval as well so
+    ref-logprobs (forward_only/eval) and train-logprobs are computed under the
+    same numerics.
+
+    Set OPEN_TRAINING_Q_FP8_FAKE_QAT_IN_EVAL=0 to opt out.
+    """
+    env = os.getenv("OPEN_TRAINING_Q_FP8_FAKE_QAT_IN_EVAL")
+    if env is None:
+        return True
+    return env == "1"
 
 
 def _normalize_kv_scale_list(scales):
